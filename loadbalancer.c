@@ -15,10 +15,7 @@
 
 
 
-//#define SERVER_IP "192.168.0.37"  // 서버 IP 주소
-//#define SERVER_PORT 5000// 서버 포트 번호
 #define LB_IP "192.168.0.6"
-//#define LB_PORT_FOR_SERVER 9191 
 #define LB_PORT_FOR_CLIENT 9090
 #define BUF_SIZE 1500
 #define EPOLL_SIZE 50
@@ -46,8 +43,9 @@ int table_current_idx;
 struct serv_info{
 	char serv_IP[15];
 	uint16_t serv_PORT;
-	bool is_connected;
-	int sock;
+	uint16_t serv_TCP_PORT;
+	bool disconnect;
+	int tcp_sock;
 	int connect_cnt;
 	int resource_rate;
 };
@@ -67,7 +65,7 @@ void setnonblockingmode(int fd)
         fcntl(fd, F_SETFL, flag|O_NONBLOCK);
 }
 
-uint16_t checksum(uint8_t *buffer, int len){
+uint16_t checksum(uint8_t *buffer, int len){ //Checksum Calculation For Rawsocket
 
         uint32_t sum = 0;
         uint16_t *p = (uint16_t*)buffer;
@@ -90,7 +88,7 @@ uint16_t checksum(uint8_t *buffer, int len){
         return ((uint16_t)~sum);
 }
 
-struct pseudo_header createPseudoHeader(struct iphdr *ip_header, uint16_t tcp_frame_len){
+struct pseudo_header createPseudoHeader(struct iphdr *ip_header, uint16_t tcp_frame_len){//PseudoHeader For Checksum Calculation
         
 	struct pseudo_header p_header;
 	memset(&p_header, 0, sizeof(struct pseudo_header));	
@@ -124,7 +122,6 @@ int replaceIP(struct iphdr *ip_header, char* src, char* dst){
 
 int replacePort(struct tcphdr *tcp_header, uint16_t src, uint16_t dst){
 	tcp_header->source = htons(src);
-    	// Modify the destination port
     	tcp_header->dest = htons(dst);
 }
 
@@ -135,7 +132,6 @@ int serverConnect(char* server_ip, uint16_t server_port){
     char recv_data[1024];
     int bytes_received;
 
-    // 소켓 생성
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("Socket creation error");
         return -1;
@@ -144,13 +140,11 @@ int serverConnect(char* server_ip, uint16_t server_port){
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(server_port);
 
-    // 서버 주소 변환
     if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
         perror("Invalid address/ Address not supported");
         return -1;
     }
 
-    // 서버에 연결
     if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("Connection Failed");
         return -1;
@@ -172,37 +166,43 @@ int lb_algorithm(uint8_t user_algo, struct serv_info *serv_info, int *RR_idx){
 	
 	int selected_serv;
 	int current_idx_RR = ++(*RR_idx);
+	int minimum_idx = 0;
 	switch(user_algo){
-		case 0://RR
+		case 0://Round Robin
 			if((current_idx_RR) >= serv_total_connection){
 				 *RR_idx = 0;
 			}
+			for(int i = current_idx_RR; i < serv_total_connection; i++){//Checking Disconnect
+				if(serv_info[i].disconnect == false) break;
+				current_idx_RR = ++(*RR_idx);
+			}
 			selected_serv = *RR_idx;
 			break;
-		case 1://AL
-			int minimum_idx = 0;
+		case 1://At Least
 			int minimum_connection = serv_info[0].connect_cnt;
 			for(int i = 1; i < serv_total_connection; i++){
-				if(minimum_connection > serv_info[i].connect_cnt){
+				if((minimum_connection > serv_info[i].connect_cnt) && (serv_info[i].disconnect == false)){
 					minimum_idx = i;
 					minimum_connection = serv_info[i].connect_cnt;
 				}
 			}
 			selected_serv = minimum_idx;
-			serv_info[minimum_idx].connect_cnt++;
 			break;
-		case 2://RB
+		case 2://Resource Based
+			int minimum_resource = serv_info[0].resource_rate;
+			for(int i = 1; i < serv_total_connection; i++){
+				if((minimum_connection > serv_info[i].resource_rate) && (serv_info[i].disconnect == false)){
+					minimum_idx = i;
+					minimum_resource= serv_info[i].resource_rate;
+				}
+			}
+			selected_serv = minimum_idx;
 			break;
 	}
 	return selected_serv;
-	//time();
-	//send();
-	//fork();
-
 }
 
 void makeTable(struct serv_info target_serv, uint16_t lb_PORT){//serv_info, serv_idx, clnt_addr
-	
 	strcpy(table[table_current_idx].clnt_IP, clnt_ip);
 	table[table_current_idx].clnt_IP[strlen(clnt_ip)] = 0x0;
 	table[table_current_idx].clnt_PORT = clnt_port;
@@ -301,22 +301,23 @@ int main(int argc, char *argv[]) {
 	exit(1);
     }
     struct serv_info serv_info[MAX_SERVER_CONNECTION];
-    while(fscanf(fp, "%s %hu",serv_info[serv_total_connection].serv_IP, &serv_info[serv_total_connection].serv_PORT) == 2){
+    while(fscanf(fp, "%s %hu %hu",serv_info[serv_total_connection].serv_IP, &serv_info[serv_total_connection].serv_PORT, &serv_info[serv_total_connection].serv_TCP_PORT) == 3){
 	serv_total_connection++;
     }
 
-    //Make a socket to connect to the servers.
-    for(int i = 0; i < serv_total_connection; i++){
-    	serv_info[i].sock = serverConnect(serv_info[i].serv_IP, serv_info[i].serv_PORT);
-	if(serv_info[i].sock == -1){
+    //Make a socket to connect to the TCP servers.
+    for(int i = 0; i < serv_total_connection; i++){ 
+    	serv_info[i].tcp_sock = serverConnect(serv_info[i].serv_IP, serv_info[i].serv_TCP_PORT);
+	if(serv_info[i].tcp_sock == -1){
 		fprintf(stderr, "ERROR: Check this server: %s %d\n",serv_info[i].serv_IP, serv_info[i].serv_PORT);
-		serv_info[i].is_connected = false;
+		serv_info[i].disconnect = true;
 		continue;
 	}
-	serv_info[i].connect_cnt = rand()%10;
+	serv_info[i].connect_cnt = rand()%10; //For test
+	serv_info[i].disconnect = false;
     	event.events=EPOLLIN;
-    	event.data.fd=serv_info[i].sock;
-    	epoll_ctl(epfd, EPOLL_CTL_ADD, serv_info[i].sock, &event);
+    	event.data.fd=serv_info[i].tcp_sock;
+    	epoll_ctl(epfd, EPOLL_CTL_ADD, serv_info[i].tcp_sock, &event);
     }
 
     
@@ -358,13 +359,19 @@ int main(int argc, char *argv[]) {
 			}	
 			if(tcp_header->syn == 1){
 				if(already_connected == 1) continue;
-				if(user_algo == 1){ //AL mode
+				if(user_algo == 1){ //AL mode Checking
 					for(int i = 0; i < serv_total_connection; i++){
-						printf("server: %s %d\n connect_cnt: %d\n",serv_info[i].serv_IP, serv_info[i].serv_PORT, serv_info[i].connect_cnt);
+						printf("server: %s %d connect_cnt: %d\n",serv_info[i].serv_IP, serv_info[i].serv_PORT, serv_info[i].connect_cnt);
 					}
-				}		  
+				}
+				if(user_algo == 2){
+					for(int i = 0; i < serv_total_connection; i++){
+						printf("server: %s %d resource: %d\n",serv_info[i].serv_IP, serv_info[i].serv_PORT, serv_info[i].resource_rate);
+					}
+				}
+				
 				int selected_serv_idx=lb_algorithm(user_algo, serv_info, &current_idx_RR);
-				printf("selected server: %s %d\n connect_cnt: %d\n",serv_info[selected_serv_idx].serv_IP, serv_info[selected_serv_idx].serv_PORT, serv_info[selected_serv_idx].connect_cnt-1);
+				printf("\nselected server: %s %d connect_cnt: %d resource: %d \n\n",serv_info[selected_serv_idx].serv_IP, serv_info[selected_serv_idx].serv_PORT, serv_info[selected_serv_idx].connect_cnt, serv_info[selected_serv_idx].resource_rate);
 				
 				clnt_port = ntohs(tcp_header->source);
 				uint16_t lb_PORT = (rand()%48127)+1024; //To avoid well-known port.
@@ -376,43 +383,17 @@ int main(int argc, char *argv[]) {
 					} 
 				}	
 				
-				printf("SYN\n");
-				
-				/*
-				struct serv_info target_serv;
-				serv_info[selected_serv_idx].connect_cnt++;
-				memcpy(&target_serv, &serv_info[selected_serv_idx], sizeof(struct serv_info));
-				printf("selected server: %s %d\n",target_serv.serv_IP, target_serv.serv_PORT);
-						
-				if(replaceIP(ip_header, LB_IP, target_serv.serv_IP)){
-					fprintf(stderr,"ERROR: inet_pton\n");
-					exit(1);	
-				}		
-				tcp_header->check = 0;
-				
-				replacePort(tcp_header,lb_PORT, target_serv.serv_PORT); 
-
-				makePacket(buffer, ip_header, tcp_header);	
-				
-				struct sockaddr_in daddr;	
-				if(dst_setting(&daddr, target_serv.serv_IP, target_serv.serv_PORT)){
-					fprintf(stderr,"ERROR: dst_setting\n");
-					exit(1);
-				}
-				sendto(lb_clnt_sock, buffer, packet_len, 0, (struct sockaddr*)&daddr, sizeof(struct sockaddr));
-				continue;*/
 			}	
 			struct table *target_table = &table[current_table_idx];
 			
 			if(tcp_header->ack && target_table->syn_state > 0 && ((target_table->syn_seqNum+1) == ntohl(tcp_header->ack_seq))){ // For ACK about SYNACK
 				target_table->syn_state++;
-				printf("syn_state up++: %d\n",target_table->syn_state);
 				if(target_table->syn_state >= 2){
 					target_table->syn_state = 0;
 					for(int i = 0; i < serv_total_connection; i++){
 						if( (strcmp(target_table->serv_IP, serv_info[i].serv_IP) == 0) && (target_table->serv_PORT == serv_info[i].serv_PORT)){
 							serv_info[i].connect_cnt++;
-							printf("connection up+++\n");
+							//printf("connection up+++\n");
 							break;
 								}
 					}
@@ -420,16 +401,13 @@ int main(int argc, char *argv[]) {
 			}else if(tcp_header->fin){
 				target_table->fin_seqNum = ntohl(tcp_header->seq);
 				target_table->fin_state++;
-				printf("fin_state up++: %d\n",target_table->fin_state);
 			}else if(target_table->fin_state > 0 && ((target_table->fin_seqNum+1) == ntohl(tcp_header->ack_seq))){ //For ACK about FIN
 				target_table->fin_state++;
-				printf("fin_state up++: %d\n",target_table->fin_state);
 				if(target_table->fin_state >= 4) 
 					target_table->fin_state = 0;
 					for(int i = 0; i < serv_total_connection; i++){
 						if( (strcmp(target_table->serv_IP, serv_info[i].serv_IP) == 0) && (target_table->serv_PORT == serv_info[i].serv_PORT)){
 							serv_info[i].connect_cnt--;
-							printf("connection down--\n");
 							break;
 								}
 					}
@@ -444,7 +422,7 @@ int main(int argc, char *argv[]) {
 			}		
 			tcp_header->check = 0;
 			
-			replacePort(tcp_header,target_table->lb_PORT, target_table->serv_PORT); //TODO: you need to change the port later for TCP
+			replacePort(tcp_header,target_table->lb_PORT, target_table->serv_PORT); 
 
 			makePacket(buffer, ip_header, tcp_header);	
 			
@@ -456,7 +434,6 @@ int main(int argc, char *argv[]) {
 			sendto(lb_clnt_sock, buffer, packet_len, 0, (struct sockaddr*)&daddr, sizeof(struct sockaddr));
 		
 		}else if(ep_events[i].data.fd == lb_clnt_sock){//Packet From Server
-		
 			packet_len = recvfrom(lb_clnt_sock, buffer, BUF_SIZE, 0, NULL, NULL);//Only Read from LB port openned for the clients	
 			memcpy(&temp_port, buffer+22, sizeof(temp_port));
 			
@@ -478,20 +455,17 @@ int main(int argc, char *argv[]) {
 			if(tcp_header->syn && tcp_header->ack){
 				target_table->syn_seqNum = ntohl(tcp_header->seq);
 				target_table->syn_state++;
-				printf("SYNACK: syn_state up++: %d\n",table[current_table_idx].syn_state);
 			}else if(tcp_header->fin){
 				target_table->fin_seqNum = ntohl(tcp_header->seq);
 				target_table->fin_state++;
-				printf("fin_state up++: %d\n",table[current_table_idx].fin_state);
-				
 			}else if(target_table->fin_state > 0 && ((target_table->fin_seqNum + 1) == ntohl(tcp_header->ack_seq))){ //For ACK about FIN
 				target_table->fin_state++;
 				if(target_table->fin_state >= 4) 
+					
 					target_table->fin_state = 0;
 					for(int i = 0; i < serv_total_connection; i++){
 						if( (strcmp(target_table->serv_IP, serv_info[i].serv_IP) == 0) && (target_table->serv_PORT == serv_info[i].serv_PORT)){
 							serv_info[i].connect_cnt--;
-							printf("connection down--\n");
 							break;
 								}
 					}
@@ -505,7 +479,7 @@ int main(int argc, char *argv[]) {
 			}
 			ip_header->check = checksum((uint8_t*)ip_header, sizeof(struct iphdr));
 			tcp_header->check = 0;
-			replacePort(tcp_header,LB_PORT_FOR_CLIENT, target_table->clnt_PORT); //TODO: you need to change the port later for TCP
+			replacePort(tcp_header,LB_PORT_FOR_CLIENT, target_table->clnt_PORT); 
 			
 			makePacket(buffer,ip_header, tcp_header);
 			
@@ -515,6 +489,15 @@ int main(int argc, char *argv[]) {
 				exit(1);
 			}
 			sendto(lb_serv_sock, buffer, packet_len, 0, (struct sockaddr*)&daddr, sizeof(struct sockaddr));
+		}else{ //Among epoll socket, not lb_clnt_sock and lb_serv_sock. They are server socket for Heart-Beat/Resource-base through TCP connection
+			
+			packet_len = recv(ep_events[i].data.fd, buffer, BUF_SIZE, 0); 
+			for(int i = 0; i < serv_total_connection; i++){
+				if(serv_info[i].tcp_sock == ep_events[i].data.fd){
+					serv_info[i].resource_rate = (uint16_t)atoi(buffer);
+					break;
+				}
+			}
 		}
 	}
     }
