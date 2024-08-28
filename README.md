@@ -14,7 +14,7 @@ RB = Resource Based, Loadbalancer choose the server with minimum cpu and memory 
 Environmnet: Raspberrypi/Raspbian OS   
 Language: C   
 Test Tool: Flask(For Web service)   
-
+Loadbalancing Algorithm: Round Robin, Least Connection, Free Resource
 ## Interesting technical skill
 - Epoll
 - RawSocket
