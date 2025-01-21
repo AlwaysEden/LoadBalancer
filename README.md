@@ -18,4 +18,4 @@ Loadbalancing Algorithm: Round Robin, Least Connection, Free Resource
 ## Interesting technical skill
 - Epoll
 - RawSocket
-- Loadbalancer(Type: Direct Server Return)
+- Loadbalancer(Type: Proxy)
